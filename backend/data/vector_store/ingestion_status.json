@@ -1,0 +1,16 @@
+{
+  "rebuild_index": true,
+  "indexed_documents": 1,
+  "indexed_chunks": 201,
+  "parser_ready": true,
+  "documents": [
+    {
+      "source_path": "C:\\Users\\karde\\Downloads\\Profesyonel_Rayli_Sistem_Bakim_RAG_Dataset.pdf",
+      "stored_path": "C:\\Users\\karde\\OneDrive\\Masa\u00fcst\u00fc\\microsft\\local-rag-assistant\\backend\\data\\raw_pdfs\\Profesyonel_Rayli_Sistem_Bakim_RAG_Dataset.pdf",
+      "file_name": "Profesyonel_Rayli_Sistem_Bakim_RAG_Dataset.pdf",
+      "ingested_at": "2026-07-19T12:06:19.129167+00:00",
+      "chunk_count": 201
+    }
+  ],
+  "updated_at": "2026-07-19T12:06:19.130166+00:00"
+}
