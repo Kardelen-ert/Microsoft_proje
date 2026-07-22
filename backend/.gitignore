@@ -1,0 +1,8 @@
+# Veritabanı ve Vektör Store (Bunlar bilgisayarında kalmalı)
+data/vector_store/
+__pycache__/
+*.pyc
+
+# Sanal Ortam
+venv/
+.env

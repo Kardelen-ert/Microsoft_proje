@@ -1,4 +1,4 @@
-"""Document ingestion helpers for local PDF management."""
+"""Document ingestion helpers for local PDF management with ChromaDB Vector Storage."""
 
 from __future__ import annotations
 
@@ -7,6 +7,11 @@ import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Langchain ve ChromaDB kütüphaneleri
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
 from app.core.config import Settings
 from app.core.constants import STATUS_FILE_NAME, SUPPORTED_DOCUMENT_SUFFIXES
@@ -45,15 +50,20 @@ class IngestionResult:
 
 
 class LocalDocumentIngestionPipeline:
-    """Copies local PDF files into the backend data area and writes a status manifest."""
+    """Copies local PDF files into the backend data area, writes a status manifest, and stores vectors in ChromaDB."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.status_file = settings.vector_store_dir / STATUS_FILE_NAME
         self.chunk_store_file = settings.vector_store_dir / "chunks.json"
+        
+        # Vektör veritabanı klasörü
+        self.chroma_db_dir = settings.vector_store_dir / "chroma_db"
+        # HuggingFace modelimiz
+        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
     def ingest(self, file_paths: list[str], rebuild_index: bool) -> IngestionResult:
-        """Validate, copy, and persist metadata for the given file paths."""
+        """Validate, copy, persist metadata for the given file paths, and store in vector database."""
 
         self.settings.raw_pdfs_dir.mkdir(parents=True, exist_ok=True)
         self.settings.vector_store_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +74,7 @@ class LocalDocumentIngestionPipeline:
         ingested_documents: list[IngestedDocument] = []
         all_chunks: list[ChunkRecord] = []
         parser_ready = self._is_pdf_parser_available()
+        
         for raw_path in file_paths:
             source_path = Path(raw_path).expanduser().resolve()
             self._validate_source_file(source_path)
@@ -83,6 +94,27 @@ class LocalDocumentIngestionPipeline:
                 )
             )
 
+        # ChromaDB Vektör Kayıt İşlemi
+        if all_chunks:
+            docs = [
+                Document(
+                    page_content=chunk.text,
+                    metadata={
+                        "chunk_id": chunk.chunk_id,
+                        "document_name": chunk.document_name,
+                        "page_number": chunk.page_number
+                    }
+                )
+                for chunk in all_chunks
+            ]
+            
+            vector_store = Chroma(
+                collection_name="railway_diagnostics",
+                embedding_function=self.embeddings,
+                persist_directory=str(self.chroma_db_dir)
+            )
+            vector_store.add_documents(docs)
+
         manifest = {
             "rebuild_index": rebuild_index,
             "indexed_documents": len(ingested_documents),
@@ -91,6 +123,7 @@ class LocalDocumentIngestionPipeline:
             "documents": [asdict(item) for item in ingested_documents],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        
         self.status_file.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=True),
             encoding="utf-8",
@@ -122,7 +155,7 @@ class LocalDocumentIngestionPipeline:
         return json.loads(self.status_file.read_text(encoding="utf-8"))
 
     def _clear_existing_documents(self) -> None:
-        """Remove previously copied PDFs and reset the status manifest."""
+        """Remove previously copied PDFs, reset the status manifest, and clear ChromaDB."""
 
         for pdf_file in self.settings.raw_pdfs_dir.glob("*.pdf"):
             pdf_file.unlink()
@@ -132,6 +165,10 @@ class LocalDocumentIngestionPipeline:
 
         if self.chunk_store_file.exists():
             self.chunk_store_file.unlink()
+            
+        # Vektör veritabanı klasörünü tamamen sil
+        if self.chroma_db_dir.exists() and self.chroma_db_dir.is_dir():
+            shutil.rmtree(self.chroma_db_dir)
 
     def _extract_chunks(self, pdf_path: Path) -> list[ChunkRecord]:
         """Extract text from a PDF and split it into overlapping chunks."""

@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# RAG verileri
+backend/data/vector_store/
+
+# Loglar
+*.log

@@ -3,20 +3,60 @@
 from __future__ import annotations
 
 import json
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 from app.core.config import get_settings
-from app.rag.retriever import LocalKeywordRetriever
+from app.rag.retriever import LocalVectorRetriever 
 from app.schemas.query import DiagnosticResponse, QuestionRequest
 
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain_huggingface import HuggingFacePipeline
+from langchain_core.prompts import PromptTemplate
 
 class RAGEngine:
     """Coordinates retrieval and grounded answer generation."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.retriever = LocalKeywordRetriever()
+        self.retriever = LocalVectorRetriever()
+        
+        # 1. Modeli sistem başlarken belleğe alıyoruz
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        
+        # device_map="auto" modeli otomatik olarak algıladığı en iyi GPU'ya atar.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map="auto"
+        )
+        
+        # 2. Text-Generation Pipeline Kurulumu (Durdurma belirteçleri eklendi)
+        pipe = pipeline(
+            "text-generation",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            max_new_tokens=256,
+            temperature=0.1, 
+            do_sample=True,
+            repetition_penalty=1.1,
+            return_full_text=False,
+            eos_token_id=self.tokenizer.eos_token_id, 
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+        
+        self.llm = HuggingFacePipeline(pipeline=pipe)
+        
+# 3. Raylı Sistemler Prompt Şablonu (İngilizce yönlendirme, Türkçe çıktı)
+        template = """<|system|>
+You are an expert Railway Systems Maintenance Assistant. Answer the technician's question using ONLY the provided context below. Do not add external information. You must answer in Turkish. If the context does not contain the answer, say "Bu konuda dökümanlarda bilgi bulamadım".</s>
+<|user|>
+Context:
+{context}
+
+Question: {question}</s>
+<|assistant|>
+"""
+        self.prompt = PromptTemplate.from_template(template)
+        self.chain = self.prompt | self.llm
 
     def answer_question(self, payload: QuestionRequest) -> DiagnosticResponse:
         """Generate a grounded response from retrieved local chunks only."""
@@ -35,13 +75,17 @@ class RAGEngine:
             )
 
         sources = [item.source for item in retrieved_chunks]
+        
+        # Yerel in-memory modelimizi çağırıyoruz
         llm_answer = self._query_local_llm(payload.question, sources)
+        
+        # LLM'de bellek hatası vs. olursa fallback sistemi devreye girecek
         if llm_answer is None:
             llm_answer = self._build_extractive_fallback_answer(sources)
 
-        top_score = retrieved_chunks[0].score if retrieved_chunks else 0.0
-        grounded = bool(sources) and top_score > 0
-        confidence = min(1.0, top_score + min(len(sources), 3) * 0.1)
+        top_score = retrieved_chunks[0].score if retrieved_chunks else 1.0 
+        grounded = bool(sources) and top_score < 1.0 
+        confidence = max(0.0, min(1.0, 1.0 - (top_score / 2.0) + min(len(sources), 3) * 0.1))
 
         return DiagnosticResponse(
             answer=llm_answer,
@@ -52,55 +96,40 @@ class RAGEngine:
         )
 
     def _query_local_llm(self, question: str, sources: list) -> str | None:
-        """Ask the local Foundry-compatible chat endpoint for a strictly grounded answer."""
+        """Generate answer using local HuggingFace model dynamically."""
 
         if not sources:
             return None
 
+        # ChromaDB'den gelen parçaları tek bir metin bloğunda birleştiriyoruz
         context = "\n\n".join(
             [
                 f"Belge: {source.document_name} | Sayfa: {source.page_number}\n{source.chunk_text}"
                 for source in sources
             ]
         )
-        prompt = (
-            "Sadece verilen baglama dayanarak cevap ver. "
-            "Baglamda yoksa bilmedigini soyle. Teknik olmayan tahmin uretme.\n\n"
-            f"Soru: {question}\n\nBaglam:\n{context}"
-        )
-        body = {
-            "model": self.settings.llm_model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0,
-        }
-        request = Request(
-            url=f"{self.settings.llm_base_url}/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
+        
         try:
-            with urlopen(request, timeout=5) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (URLError, TimeoutError, json.JSONDecodeError, OSError):
+            # Hazırladığımız LangChain chain'ini tetikliyoruz
+            response = self.chain.invoke({
+                "context": context,
+                "question": question
+            })
+            
+            if isinstance(response, str) and response.strip():
+                return response.strip()
+        except Exception as e:
+            # Model patlarsa sessizce None dönüp fallback'in çalışmasını sağlıyoruz
+            print(f"LLM Uretim Hatasi: {e}")
             return None
-
-        choices = payload.get("choices", [])
-        if not choices:
-            return None
-
-        message = choices[0].get("message", {})
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
+            
         return None
 
     def _build_extractive_fallback_answer(self, sources: list) -> str:
         """Build a deterministic answer without inventing unsupported facts."""
 
         lines = [
-            "Yerel LLM erisilemedigi icin dokumanlardan dogrudan alinan ilgili bolumler listeleniyor:"
+            "Yerel LLM yanit uretemedigi icin dokumanlardan dogrudan alinan ilgili bolumler listeleniyor:"
         ]
         for source in sources:
             snippet = source.chunk_text[:280].strip()
