@@ -1,15 +1,20 @@
-# Virtual environment
 venv/
-
-# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Environment
 .env
+.venv/
+.vscode/
+.idea/
 
-# RAG verileri
+backend/logs/
+backend/data/raw_pdfs/
 backend/data/vector_store/
+backend/data/*.db
 
-# Loglar
-*.log
+frontend/flutter_app/.dart_tool/
+frontend/flutter_app/build/
+frontend/flutter_app/.flutter-plugins
+frontend/flutter_app/.flutter-plugins-dependencies
