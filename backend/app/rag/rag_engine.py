@@ -45,14 +45,14 @@ class RAGEngine:
         
         self.llm = HuggingFacePipeline(pipeline=pipe)
         
-# 3. Raylı Sistemler Prompt Şablonu (İngilizce yönlendirme, Türkçe çıktı)
+# 3. Raylı Sistemler Prompt Şablonu (Tamamen Türkçe yönlendirme)
         template = """<|system|>
-You are an expert Railway Systems Maintenance Assistant. Answer the technician's question using ONLY the provided context below. Do not add external information. You must answer in Turkish. If the context does not contain the answer, say "Bu konuda dökümanlarda bilgi bulamadım".</s>
+Sen raylı sistemler arıza teşhisi konusunda uzman bir yapay zeka asistanısın. Teknisyenin sorusunu SADECE aşağıdaki bağlamı (context) kullanarak ve KESİNLİKLE TÜRKÇE dilinde yanıtla. Kendi bilgini ekleme. Eğer bağlamda sorunun cevabı yoksa, sadece "Bu konuda dokümanlarda bilgi bulamadım." de.</s>
 <|user|>
-Context:
+Bağlam:
 {context}
 
-Question: {question}</s>
+Soru: {question}</s>
 <|assistant|>
 """
         self.prompt = PromptTemplate.from_template(template)
