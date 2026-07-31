@@ -1,4 +1,4 @@
-"""Document ingestion helpers for local PDF management with ChromaDB Vector Storage."""
+"""Document ingestion helpers for local document management with vector indexing."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Langchain ve ChromaDB kütüphaneleri
-from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.config import Settings
-from app.core.constants import STATUS_FILE_NAME, SUPPORTED_DOCUMENT_SUFFIXES
+from app.core.constants import CHUNK_STORE_FILE_NAME, STATUS_FILE_NAME, SUPPORTED_DOCUMENT_SUFFIXES
+from app.db.repositories import DocumentRepository
+from app.rag.embeddings import EmbeddingService
+from app.rag.vector_store import ChromaVectorStore
 
 
 @dataclass
@@ -30,7 +30,7 @@ class IngestedDocument:
 
 @dataclass
 class ChunkRecord:
-    """Normalized chunk payload generated from PDF text."""
+    """Normalized chunk payload generated from source text."""
 
     chunk_id: str
     document_name: str
@@ -50,20 +50,22 @@ class IngestionResult:
 
 
 class LocalDocumentIngestionPipeline:
-    """Copies local PDF files into the backend data area, writes a status manifest, and stores vectors in ChromaDB."""
+    """Copies local files into the backend data area and indexes chunks in ChromaDB."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.status_file = settings.vector_store_dir / STATUS_FILE_NAME
-        self.chunk_store_file = settings.vector_store_dir / "chunks.json"
-        
-        # Vektör veritabanı klasörü
-        self.chroma_db_dir = settings.vector_store_dir / "chroma_db"
-        # HuggingFace modelimiz
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.chunk_store_file = settings.vector_store_dir / CHUNK_STORE_FILE_NAME
+        self.document_repository = DocumentRepository()
+        self.embedding_service = EmbeddingService()
+        self.vector_store = ChromaVectorStore()
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=120,
+        )
 
     def ingest(self, file_paths: list[str], rebuild_index: bool) -> IngestionResult:
-        """Validate, copy, persist metadata for the given file paths, and store in vector database."""
+        """Validate, copy, persist metadata for the given file paths, and store vectors."""
 
         self.settings.raw_pdfs_dir.mkdir(parents=True, exist_ok=True)
         self.settings.vector_store_dir.mkdir(parents=True, exist_ok=True)
@@ -74,15 +76,22 @@ class LocalDocumentIngestionPipeline:
         ingested_documents: list[IngestedDocument] = []
         all_chunks: list[ChunkRecord] = []
         parser_ready = self._is_pdf_parser_available()
-        
+        embeddings_ready = self.embedding_service.is_available()
+
         for raw_path in file_paths:
             source_path = Path(raw_path).expanduser().resolve()
             self._validate_source_file(source_path)
 
             destination_path = self.settings.raw_pdfs_dir / source_path.name
-            shutil.copy2(source_path, destination_path)
-            document_chunks = self._extract_chunks(destination_path) if parser_ready else []
+            if source_path != destination_path:
+                shutil.copy2(source_path, destination_path)
+            document_chunks = (
+                self._extract_chunks(destination_path, parser_ready=parser_ready)
+                if self._can_extract_text(destination_path, parser_ready=parser_ready)
+                else []
+            )
             all_chunks.extend(document_chunks)
+            self._persist_document(destination_path, document_chunks)
 
             ingested_documents.append(
                 IngestedDocument(
@@ -94,36 +103,34 @@ class LocalDocumentIngestionPipeline:
                 )
             )
 
-        # ChromaDB Vektör Kayıt İşlemi
-        if all_chunks:
-            docs = [
-                Document(
-                    page_content=chunk.text,
-                    metadata={
-                        "chunk_id": chunk.chunk_id,
-                        "document_name": chunk.document_name,
-                        "page_number": chunk.page_number
-                    }
-                )
+        if all_chunks and embeddings_ready:
+            ids = [chunk.chunk_id for chunk in all_chunks]
+            documents = [chunk.text for chunk in all_chunks]
+            metadatas = [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "document_name": chunk.document_name,
+                    "page_number": chunk.page_number,
+                }
                 for chunk in all_chunks
             ]
-            
-            vector_store = Chroma(
-                collection_name="railway_diagnostics",
-                embedding_function=self.embeddings,
-                persist_directory=str(self.chroma_db_dir)
+            embeddings = self.embedding_service.embed_documents(documents)
+            self.vector_store.add_chunks(
+                ids=ids,
+                documents=documents,
+                embeddings=embeddings,
+                metadatas=metadatas,
             )
-            vector_store.add_documents(docs)
 
         manifest = {
             "rebuild_index": rebuild_index,
             "indexed_documents": len(ingested_documents),
             "indexed_chunks": len(all_chunks),
-            "parser_ready": parser_ready,
+            "parser_ready": parser_ready and embeddings_ready,
             "documents": [asdict(item) for item in ingested_documents],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        
+
         self.status_file.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=True),
             encoding="utf-8",
@@ -137,7 +144,7 @@ class LocalDocumentIngestionPipeline:
             ingested_documents=ingested_documents,
             rebuild_index=rebuild_index,
             indexed_chunks=len(all_chunks),
-            parser_ready=parser_ready,
+            parser_ready=parser_ready and embeddings_ready,
         )
 
     def read_status(self) -> dict:
@@ -157,20 +164,55 @@ class LocalDocumentIngestionPipeline:
     def _clear_existing_documents(self) -> None:
         """Remove previously copied PDFs, reset the status manifest, and clear ChromaDB."""
 
-        for pdf_file in self.settings.raw_pdfs_dir.glob("*.pdf"):
-            pdf_file.unlink()
+        for stored_file in self.settings.raw_pdfs_dir.iterdir():
+            if stored_file.is_file():
+                stored_file.unlink()
 
         if self.status_file.exists():
             self.status_file.unlink()
 
         if self.chunk_store_file.exists():
             self.chunk_store_file.unlink()
-            
-        # Vektör veritabanı klasörünü tamamen sil
-        if self.chroma_db_dir.exists() and self.chroma_db_dir.is_dir():
-            shutil.rmtree(self.chroma_db_dir)
 
-    def _extract_chunks(self, pdf_path: Path) -> list[ChunkRecord]:
+        self.document_repository.clear_documents()
+
+        try:
+            self.vector_store.reset_collection()
+        except Exception:
+            pass
+
+    def _persist_document(self, pdf_path: Path, chunks: list[ChunkRecord]) -> None:
+        """Store document metadata and chunk rows in SQLite."""
+
+        document_id = self.document_repository.create_document(
+            file_path=str(pdf_path),
+            title=pdf_path.stem,
+        )
+
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            self.document_repository.add_chunk(
+                document_id=document_id,
+                chunk_index=chunk_index,
+                content=chunk.text,
+                page_number=chunk.page_number,
+                token_count=chunk.char_count,
+                source_label=f"{chunk.document_name} - Page {chunk.page_number}",
+                chunk_id=chunk.chunk_id,
+            )
+
+    def _extract_chunks(self, source_path: Path, parser_ready: bool) -> list[ChunkRecord]:
+        """Extract text from a supported source file and split it into chunks."""
+
+        suffix = source_path.suffix.lower()
+        if suffix == ".pdf":
+            return self._extract_pdf_chunks(source_path)
+        if suffix in {".md", ".txt"}:
+            return self._extract_text_chunks(source_path)
+        if not parser_ready:
+            return []
+        return []
+
+    def _extract_pdf_chunks(self, pdf_path: Path) -> list[ChunkRecord]:
         """Extract text from a PDF and split it into overlapping chunks."""
 
         from pypdf import PdfReader
@@ -195,6 +237,26 @@ class LocalDocumentIngestionPipeline:
 
         return chunks
 
+    def _extract_text_chunks(self, text_path: Path) -> list[ChunkRecord]:
+        """Extract chunks from a markdown or plain-text source."""
+
+        text = text_path.read_text(encoding="utf-8").strip()
+        if not text:
+            return []
+
+        chunks: list[ChunkRecord] = []
+        for chunk_index, chunk_text in enumerate(self._split_text(text), start=1):
+            chunks.append(
+                ChunkRecord(
+                    chunk_id=f"{text_path.stem}-p1-c{chunk_index}",
+                    document_name=text_path.name,
+                    page_number=1,
+                    text=chunk_text,
+                    char_count=len(chunk_text),
+                )
+            )
+        return chunks
+
     def _split_text(
         self,
         text: str,
@@ -207,17 +269,11 @@ class LocalDocumentIngestionPipeline:
         if not normalized:
             return []
 
-        chunks: list[str] = []
-        start = 0
-        text_length = len(normalized)
-        while start < text_length:
-            end = min(start + chunk_size, text_length)
-            chunks.append(normalized[start:end])
-            if end >= text_length:
-                break
-            start = max(end - chunk_overlap, start + 1)
-
-        return chunks
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        return splitter.split_text(normalized)
 
     def _is_pdf_parser_available(self) -> bool:
         """Check whether the optional PDF parser dependency is installed."""
@@ -227,6 +283,16 @@ class LocalDocumentIngestionPipeline:
         except ImportError:
             return False
         return True
+
+    def _can_extract_text(self, source_path: Path, parser_ready: bool) -> bool:
+        """Return whether a given file can be parsed in the current environment."""
+
+        suffix = source_path.suffix.lower()
+        if suffix in {".md", ".txt"}:
+            return True
+        if suffix == ".pdf":
+            return parser_ready
+        return False
 
     def _validate_source_file(self, source_path: Path) -> None:
         """Check that the incoming file exists and is an allowed document type."""
@@ -239,5 +305,6 @@ class LocalDocumentIngestionPipeline:
 
         if source_path.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
             raise ValueError(
-                f"Unsupported document type '{source_path.suffix}'. Only PDF is allowed."
+                f"Unsupported document type '{source_path.suffix}'. Allowed types: "
+                f"{', '.join(sorted(SUPPORTED_DOCUMENT_SUFFIXES))}."
             )

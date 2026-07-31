@@ -1,0 +1,11 @@
+Soru: Chunk boyutu neden onemlidir?
+Cevap: Chunk boyutu cok buyuk olursa retrieval hedefi dagilir. Cok kucuk olursa anlam butunlugu bozulur. Dengeli bir chunk boyutu, hem semantik eslesmeyi hem de model baglam kalitesini iyilestirir.
+
+Soru: Embedding tekrar tekrar uretilmeli mi?
+Cevap: Hayir. Ayni dokuman degismedigi surece embedding sonuclari saklanmali ve yeniden kullanilmalidir. Bu yaklasim yanit suresini ve sistem verimliligini iyilestirir.
+
+Soru: Sistem kaynak bulamazsa ne yapmali?
+Cevap: Sistem tahmin yurutmek yerine, yeterli bilgi olmadigini acikca belirtmelidir.
+
+Soru: SQLite neden kullanilir?
+Cevap: SQLite tek dosyada calisan, kolay tasinan ve kucuk projeler icin yeterli olan yerel bir veritabani cozumudur.

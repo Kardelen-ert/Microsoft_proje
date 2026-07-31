@@ -33,6 +33,8 @@ class DocumentStatusResponse(BaseModel):
     total_documents: int = Field(..., ge=0)
     indexed_documents: int = Field(..., ge=0)
     indexed_chunks: int = Field(..., ge=0)
+    sqlite_documents: int = Field(..., ge=0)
+    sqlite_chunks: int = Field(..., ge=0)
     vector_store_ready: bool
     parser_ready: bool
     last_ingested_files: list[str] = Field(default_factory=list)

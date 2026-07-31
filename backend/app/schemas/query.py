@@ -7,6 +7,10 @@ class QuestionRequest(BaseModel):
     """Incoming technician question payload."""
 
     question: str = Field(..., min_length=5, description="Technician question")
+    session_id: str | None = Field(
+        default=None,
+        description="Optional chat session identifier for storing message history",
+    )
     asset_id: str | None = Field(
         default=None,
         description="Optional vehicle, subsystem, or equipment identifier",
@@ -33,5 +37,6 @@ class DiagnosticResponse(BaseModel):
     answer: str
     grounded: bool
     confidence: float = Field(..., ge=0.0, le=1.0)
+    session_id: str | None = None
     warning: str | None = None
     sources: list[SourceChunk] = Field(default_factory=list)

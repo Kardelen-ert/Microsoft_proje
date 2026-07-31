@@ -2,61 +2,21 @@
 
 from __future__ import annotations
 
-import json
+import re
 
-from app.core.config import get_settings
-from app.rag.retriever import LocalVectorRetriever 
+from app.rag.foundry_client import FoundryLocalClient
+from app.rag.retriever import SemanticRetriever
 from app.schemas.query import DiagnosticResponse, QuestionRequest
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from langchain_huggingface import HuggingFacePipeline
-from langchain_core.prompts import PromptTemplate
 
 class RAGEngine:
     """Coordinates retrieval and grounded answer generation."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self.retriever = LocalVectorRetriever()
-        
-        # 1. Modeli sistem başlarken belleğe alıyoruz
-        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        
-        # device_map="auto" modeli otomatik olarak algıladığı en iyi GPU'ya atar.
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map="auto"
-        )
-        
-        # 2. Text-Generation Pipeline Kurulumu (Durdurma belirteçleri eklendi)
-        pipe = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_new_tokens=256,
-            temperature=0.1, 
-            do_sample=True,
-            repetition_penalty=1.1,
-            return_full_text=False,
-            eos_token_id=self.tokenizer.eos_token_id, 
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        
-        self.llm = HuggingFacePipeline(pipeline=pipe)
-        
-# 3. Raylı Sistemler Prompt Şablonu (Tamamen Türkçe yönlendirme)
-        template = """<|system|>
-Sen raylı sistemler arıza teşhisi konusunda uzman bir yapay zeka asistanısın. Teknisyenin sorusunu SADECE aşağıdaki bağlamı (context) kullanarak ve KESİNLİKLE TÜRKÇE dilinde yanıtla. Kendi bilgini ekleme. Eğer bağlamda sorunun cevabı yoksa, sadece "Bu konuda dokümanlarda bilgi bulamadım." de.</s>
-<|user|>
-Bağlam:
-{context}
+    weak_match_distance_threshold = 0.85
 
-Soru: {question}</s>
-<|assistant|>
-"""
-        self.prompt = PromptTemplate.from_template(template)
-        self.chain = self.prompt | self.llm
+    def __init__(self) -> None:
+        self.retriever = SemanticRetriever()
+        self.foundry_client = FoundryLocalClient()
 
     def answer_question(self, payload: QuestionRequest) -> DiagnosticResponse:
         """Generate a grounded response from retrieved local chunks only."""
@@ -64,76 +24,90 @@ Soru: {question}</s>
         retrieved_chunks = self.retriever.retrieve(payload.question, top_k=payload.top_k)
         if not retrieved_chunks:
             return DiagnosticResponse(
-                answer=(
-                    "Dokumanlarda soruyu destekleyen yeterli kaynak bulunamadi. "
-                    "Guvenilir cevap uretilmedi."
-                ),
+                answer="Dokumanlarda soruyu destekleyen yeterli kaynak bulunamadi.",
                 grounded=False,
                 confidence=0.0,
-                warning="Retrieval sonucu bos oldugu icin sistem tahmini cevap vermedi.",
+                warning="Kaynak bulunamadigi icin cevap uretilmedi.",
+                sources=[],
+            )
+
+        top_distance = retrieved_chunks[0].score
+        if top_distance > self.weak_match_distance_threshold:
+            return DiagnosticResponse(
+                answer="Dokumanlarda soruyu destekleyen yeterli kaynak bulunamadi.",
+                grounded=False,
+                confidence=0.0,
+                warning="En yakin kaynaklar zayif eslestigi icin cevap uretilmedi.",
                 sources=[],
             )
 
         sources = [item.source for item in retrieved_chunks]
-        
-        # Yerel in-memory modelimizi çağırıyoruz
         llm_answer = self._query_local_llm(payload.question, sources)
-        
-        # LLM'de bellek hatası vs. olursa fallback sistemi devreye girecek
-        if llm_answer is None:
+        if not llm_answer or not self._is_answer_grounded(llm_answer, sources):
             llm_answer = self._build_extractive_fallback_answer(sources)
+            warning = (
+                "Model cevabi baglama yeterince sadik bulunmadi; dogrudan kaynak ozeti gosterildi."
+            )
+        else:
+            warning = None
 
-        top_score = retrieved_chunks[0].score if retrieved_chunks else 1.0 
-        grounded = bool(sources) and top_score < 1.0 
-        confidence = max(0.0, min(1.0, 1.0 - (top_score / 2.0) + min(len(sources), 3) * 0.1))
+        confidence = max(
+            0.0,
+            min(1.0, 1.0 - min(top_distance, 1.0) / 2.0 + min(len(sources), 3) * 0.1),
+        )
 
         return DiagnosticResponse(
             answer=llm_answer,
-            grounded=grounded,
+            grounded=True,
             confidence=round(confidence, 2),
-            warning=None if grounded else "Yanitta yeterli grounding saglanamadi.",
+            warning=warning,
             sources=sources,
         )
 
     def _query_local_llm(self, question: str, sources: list) -> str | None:
-        """Generate answer using local HuggingFace model dynamically."""
+        """Generate answer using the local Foundry-compatible endpoint."""
 
         if not sources:
             return None
 
-        # ChromaDB'den gelen parçaları tek bir metin bloğunda birleştiriyoruz
         context = "\n\n".join(
             [
                 f"Belge: {source.document_name} | Sayfa: {source.page_number}\n{source.chunk_text}"
                 for source in sources
             ]
         )
-        
-        try:
-            # Hazırladığımız LangChain chain'ini tetikliyoruz
-            response = self.chain.invoke({
-                "context": context,
-                "question": question
-            })
-            
-            if isinstance(response, str) and response.strip():
-                return response.strip()
-        except Exception as e:
-            # Model patlarsa sessizce None dönüp fallback'in çalışmasını sağlıyoruz
-            print(f"LLM Uretim Hatasi: {e}")
-            return None
-            
-        return None
+        return self.foundry_client.generate_answer(question, context)
 
     def _build_extractive_fallback_answer(self, sources: list) -> str:
         """Build a deterministic answer without inventing unsupported facts."""
 
         lines = [
-            "Yerel LLM yanit uretemedigi icin dokumanlardan dogrudan alinan ilgili bolumler listeleniyor:"
+            "Kaynaklarda soruyla ilgili bulunan teknik bolumler ozetlenemedi; ilgili kisimlar asagidadir:"
         ]
         for source in sources:
-            snippet = source.chunk_text[:280].strip()
-            lines.append(
-                f"- {source.document_name} sayfa {source.page_number}: {snippet}"
-            )
+            snippet = " ".join(source.chunk_text.split())[:220].strip()
+            lines.append(f"- {source.document_name} sayfa {source.page_number}: {snippet}")
         return "\n".join(lines)
+
+    def _is_answer_grounded(self, answer: str, sources: list) -> bool:
+        """Apply a lightweight lexical grounding check to reduce hallucinated outputs."""
+
+        answer_tokens = {
+            self._normalize_token(token)
+            for token in answer.replace("\n", " ").split()
+            if len(self._normalize_token(token)) >= 4
+        }
+        answer_tokens.discard("")
+        if not answer_tokens:
+            return False
+
+        context_text = " ".join(
+            self._normalize_token(source.chunk_text.lower()) for source in sources
+        )
+        matched_token_count = sum(1 for token in answer_tokens if token in context_text)
+        return matched_token_count >= max(1, len(answer_tokens) // 8)
+
+    def _normalize_token(self, value: str) -> str:
+        """Normalize text for a softer lexical grounding comparison."""
+
+        return re.sub(r"[^\w\s]", "", value.lower()).strip()
